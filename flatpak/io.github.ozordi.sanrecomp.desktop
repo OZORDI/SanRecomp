@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=San Recompiled
+Exec=/app/bin/SanRecomp
+Type=Application
+Icon=io.github.ozordi.sanrecomp
+Categories=Game;
+Comment=Static recompilation of Grand Theft Auto IV (Xbox 360).
+MimeType=x-scheme-handler/sanrecomp

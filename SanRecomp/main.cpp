@@ -1,0 +1,483 @@
+#include <cstdio>
+#include <stdafx.h>
+#ifdef __x86_64__
+#include <cpuid.h>
+#endif
+#include <cpu/guest_thread.h>
+#include <gpu/video.h>
+#include <kernel/function.h>
+#include <kernel/memory.h>
+#include <kernel/heap.h>
+#include <kernel/xam.h>
+#include <kernel/save_system.h>
+#include <kernel/io/file_system.h>
+#include <kernel/vfs.h>
+#include <file.h>
+#include <vector>
+#include <image.h>
+#include <apu/audio.h>
+#include <hid/hid.h>
+#include <user/config.h>
+#include <user/paths.h>
+#include <user/registry.h>
+#include <kernel/xdbf.h>
+#include <install/installer.h>
+#include <install/update_checker.h>
+#include <os/logger.h>
+#include <os/process.h>
+#include <os/registry.h>
+#include <ui/game_window.h>
+#include <ui/installer_wizard.h>
+#include <mod/mod_loader.h>
+#include <preload_executable.h>
+#include <iostream>
+#include <app.h>
+
+#ifdef _WIN32
+#include <timeapi.h>
+#endif
+
+#if defined(_WIN32) && defined(SAN_RECOMP_D3D12)
+static std::array<std::string_view, 3> g_D3D12RequiredModules =
+{
+    "D3D12/D3D12Core.dll",
+    "dxcompiler.dll",
+    "dxil.dll"
+};
+#endif
+
+const size_t XMAIOBegin = 0x7FEA0000;
+const size_t XMAIOEnd = XMAIOBegin + 0x0000FFFF;
+
+Memory g_memory;
+Heap g_userHeap;
+XDBFWrapper g_xdbfWrapper;
+std::unordered_map<uint16_t, GuestTexture*> g_xdbfTextureCache;
+
+void HostStartup()
+{
+#ifdef _WIN32
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+#endif
+
+    hid::Init();
+}
+
+// Forward declarations from imports.cpp
+void InitKernelMainThread();
+
+// Xenon memory initialization
+#include <kernel/xenon_memory.h>
+
+// Name inspired from nt's entry point
+void KiSystemStartup()
+{
+    // Initialize main thread ID for SDL event safety
+    InitKernelMainThread();
+    
+    if (g_memory.base == nullptr)
+    {
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, GameWindow::GetTitle(), Localise("System_MemoryAllocationFailed").c_str(), GameWindow::s_pWindow);
+        std::_Exit(1);
+    }
+
+    g_userHeap.Init();
+    
+    // CRITICAL: Initialize Xbox 360 Xenon memory regions per memory contract
+    // This zeros all regions the game assumes are pre-allocated and zeroed on boot.
+    // Must happen BEFORE any game code executes to prevent corruption.
+    InitializeXenonMemoryRegions(g_memory.base);
+
+    // Initialize save system early - creates directories and registers save content
+    SaveSystem::Initialize();
+
+    const auto gameContent = XamMakeContent(XCONTENTTYPE_RESERVED, "Game");
+    const std::string gamePath = (const char*)(GetGamePath() / "game").u8string().c_str();
+
+    BuildPathCache(gamePath);
+
+    // Also cache extracted assets living under "RPF DUMP" (nested RPFS, audio packs, etc.).
+    // This improves hit rate when the title requests files that are not present in game/.
+    const std::string rpfDumpPath = (const char*)(GetGamePath() / "RPF DUMP").u8string().c_str();
+    if (std::filesystem::exists(rpfDumpPath))
+        BuildPathCache(rpfDumpPath);
+
+    XamRegisterContent(gameContent, gamePath);
+
+    // Register and mount update content (CRITICAL for file override)
+    const auto updateContent = XamMakeContent(XCONTENTTYPE_RESERVED, "Update");
+    const std::filesystem::path updateRoot = GetGamePath() / "update";
+    const std::string updatePath = (const char*)updateRoot.u8string().c_str();
+
+    if (std::filesystem::exists(updateRoot))
+    {
+        XamRegisterContent(updateContent, updatePath);
+        XamContentCreateEx(0, "update", &updateContent, OPEN_EXISTING, nullptr, nullptr, 0, 0, nullptr);
+        
+        // Create root mappings for update paths (case variations)
+        XamRootCreate("update", updatePath);
+        XamRootCreate("Update", updatePath);
+        
+        LOGF_IMPL(Utility, "Main", "Registered update: -> {}", updatePath);
+    }
+    else
+    {
+        LOGF_IMPL(Utility, "Main", "No update directory found (this is normal if no Title Update installed)");
+    }
+
+    // Note: Save system initialization already handled by SaveSystem::Initialize() above
+    // This section is kept for backwards compatibility with old save file format
+    const auto saveFilePath = GetSaveFilePath(true);
+    bool saveFileExists = std::filesystem::exists(saveFilePath);
+
+    if (!saveFileExists)
+    {
+        // Copy base save data to modded save as fallback.
+        std::error_code ec;
+        std::filesystem::create_directories(saveFilePath.parent_path(), ec);
+
+        if (!ec)
+        {
+            std::filesystem::copy_file(GetSaveFilePath(false), saveFilePath, ec);
+            saveFileExists = !ec;
+        }
+    }
+
+    if (saveFileExists)
+    {
+        std::u8string savePathU8 = saveFilePath.parent_path().u8string();
+        XamRegisterContent(XamMakeContent(XCONTENTTYPE_SAVEDATA, "GTA5SaveData.bin"), (const char*)(savePathU8.c_str()));
+    }
+
+    // Mount game
+    XamContentCreateEx(0, "game", &gameContent, OPEN_EXISTING, nullptr, nullptr, 0, 0, nullptr);
+
+    // OS mounts game data to D:
+    XamContentCreateEx(0, "D", &gameContent, OPEN_EXISTING, nullptr, nullptr, 0, 0, nullptr);
+
+    // GTA V uses "common:" and "platform:" root paths
+    // All game files are in: GetGamePath() / "game" / (common/, xbox360/, audio/)
+    // Structure: ~/Library/Application Support/SanRecomp/game/common/, etc.
+    const auto gameRoot = GetGamePath() / "game";
+    const std::string commonPath = (const char*)(gameRoot / "common").u8string().c_str();
+    const std::string platformPath = (const char*)(gameRoot / "xbox360").u8string().c_str();
+    const std::string audioPath = (const char*)(gameRoot / "audio").u8string().c_str();
+    
+    // Register main root paths
+    XamRootCreate("common", commonPath);
+    XamRootCreate("platform", platformPath);
+    XamRootCreate("audio", audioPath);
+    
+    // Also register alternate names the game might use
+    XamRootCreate("xbox360", platformPath);  // Some code uses xbox360: instead of platform:
+    
+    LOGF_IMPL(Utility, "Main", "Game root: {}", gameRoot.string());
+    LOGF_IMPL(Utility, "Main", "Registered common: -> {}", commonPath);
+    LOGF_IMPL(Utility, "Main", "Registered platform: -> {}", platformPath);
+    LOGF_IMPL(Utility, "Main", "Registered audio: -> {}", audioPath);
+
+    // Initialize Virtual File System for direct file serving
+    // This bypasses complex RPF offset-based reading that causes stream issues
+    VFS::Initialize(gameRoot);
+    LOGF_IMPL(Utility, "Main", "VFS initialized with root: {}", gameRoot.string());
+
+    std::error_code ec;
+    for (auto& file : std::filesystem::directory_iterator(GetGamePath() / "dlc", ec))
+    {
+        if (file.is_directory())
+        {
+            std::u8string fileNameU8 = file.path().filename().u8string();
+            std::u8string filePathU8 = file.path().u8string();
+            const char* fileName = (const char*)(fileNameU8.c_str());
+            const char* filePath = (const char*)(filePathU8.c_str());
+            
+            // Register DLC content
+            XamRegisterContent(XamMakeContent(XCONTENTTYPE_DLC, fileName), filePath);
+            
+            // Mount DLC to virtual path
+            auto dlcContent = XamMakeContent(XCONTENTTYPE_DLC, fileName);
+            XamContentCreateEx(0, fileName, &dlcContent, OPEN_EXISTING, nullptr, nullptr, 0, 0, nullptr);
+            
+            // Create root mapping for DLC-specific paths
+            XamRootCreate(fileName, filePath);
+            
+            LOGF_IMPL(Utility, "Main", "Registered DLC: {} -> {}", fileName, filePath);
+        }
+    }
+
+    XAudioInitializeSystem();
+}
+
+uint32_t LdrLoadModule(const std::filesystem::path &path)
+{
+    const auto loadResult = LoadFile(path);
+    if (loadResult.empty())
+    {
+        assert("Failed to load module" && false);
+        return 0;
+    }
+
+    const auto image = Image::ParseImage(loadResult.data(), loadResult.size());
+
+    memcpy(g_memory.Translate(image.base), image.data.get(), image.size);
+    g_xdbfWrapper = XDBFWrapper(static_cast<uint8_t*>(g_memory.Translate(image.resource_offset)), image.resource_size);
+
+    // GTA V Memory Layout Collision Fix
+    // Address 0x82003890 aliases with "common.rpf" string in image .rdata section.
+    // The game expects this to be heap-backed stream object storage.
+    // Xbox 360 kept these regions separate, but native recompilation does not.
+    // Fix: Zero the collision range and fully initialize stream struct.
+    {
+        uint8_t* collisionBase = static_cast<uint8_t*>(g_memory.Translate(0x82003880));
+        memset(collisionBase, 0, 0x80);  // Zero 0x82003880 - 0x82003900
+        
+        // Fully initialize stream struct at 0x82003890
+        // Stream struct layout (28 bytes / 7 dwords):
+        //   [0] = Object pointer (vtable holder)
+        //   [1] = Context/parameter
+        //   [2] = Buffer pointer
+        //   [3] = File position
+        //   [4] = Buffer cursor
+        //   [5] = Buffer end/limit
+        //   [6] = Buffer capacity
+        be<uint32_t>* streamPtr = reinterpret_cast<be<uint32_t>*>(g_memory.Translate(0x82003890));
+        streamPtr[0] = 0;  // Null object - stream ops will return early gracefully
+        streamPtr[1] = 0;           // Context (null is safe)
+        streamPtr[2] = 0;           // Buffer (null = no buffer)
+        streamPtr[3] = 0;           // File position
+        streamPtr[4] = 0;           // Buffer cursor
+        streamPtr[5] = 0;           // Buffer end (0 = empty)
+        streamPtr[6] = 0;           // Capacity (0 = no buffer)
+    }
+    
+    // Worker Thread Global Memory Initialization
+    // Address range 0x830F5000-0x830F8000 contains worker-related global structures.
+    // Workers read semaphore handles from this region (e.g., 0x830F7684 = base+9860).
+    // Without zeroing, workers read stale data from previous runs causing infinite polling.
+    // Fix: Zero worker globals so uninitialized handles read as NULL.
+    {
+        uint8_t* workerGlobals = static_cast<uint8_t*>(g_memory.Translate(0x830F5000));
+        if (workerGlobals) {
+            memset(workerGlobals, 0, 0x3000);  // Zero 12KB of worker globals
+            printf("[LdrLoadModule] Zeroed worker globals 0x830F5000-0x830F8000\n");
+        }
+    }
+
+    return image.entry_point;
+}
+
+#ifdef __x86_64__
+__attribute__((constructor(101), target("no-avx,no-avx2"), noinline))
+void init()
+{
+    uint32_t eax, ebx, ecx, edx;
+
+    // Execute CPUID for processor info and feature bits.
+    __get_cpuid(1, &eax, &ebx, &ecx, &edx);
+
+    // Check for AVX support.
+    if ((ecx & (1 << 28)) == 0)
+    {
+        printf("[*] CPU does not support the AVX instruction set.\n");
+
+#ifdef _WIN32
+        MessageBoxA(nullptr, "Your CPU does not meet the minimum system requirements.", "San Recompiled", MB_ICONERROR);
+#endif
+
+        std::_Exit(1);
+    }
+}
+#endif
+
+int main(int argc, char *argv[])
+{
+#ifdef _WIN32
+    timeBeginPeriod(1);
+#endif
+
+    os::process::CheckConsole();
+
+    if (!os::registry::Init())
+        LOGN_WARNING("OS does not support registry.");
+
+    os::logger::Init();
+
+    PreloadContext preloadContext;
+    preloadContext.PreloadExecutable();
+
+    bool forceInstaller = false;
+    bool forceDLCInstaller = false;
+    bool useDefaultWorkingDirectory = false;
+    bool forceInstallationCheck = false;
+    bool graphicsApiRetry = false;
+    const char *sdlVideoDriver = nullptr;
+
+    for (uint32_t i = 1; i < argc; i++)
+    {
+        forceInstaller = forceInstaller || (strcmp(argv[i], "--install") == 0);
+        forceDLCInstaller = forceDLCInstaller || (strcmp(argv[i], "--install-dlc") == 0);
+        useDefaultWorkingDirectory = useDefaultWorkingDirectory || (strcmp(argv[i], "--use-cwd") == 0);
+        forceInstallationCheck = forceInstallationCheck || (strcmp(argv[i], "--install-check") == 0);
+        graphicsApiRetry = graphicsApiRetry || (strcmp(argv[i], "--graphics-api-retry") == 0);
+        App::s_isSkipLogos = App::s_isSkipLogos || (strcmp(argv[i], "--skip-logos") == 0);
+
+        if (strcmp(argv[i], "--sdl-video-driver") == 0)
+        {
+            if ((i + 1) < argc)
+                sdlVideoDriver = argv[++i];
+            else
+                LOGN_WARNING("No argument was specified for --sdl-video-driver. Option will be ignored.");
+        }
+    }
+
+    if (!useDefaultWorkingDirectory)
+    {
+        // Set the current working directory to the executable's path.
+        std::error_code ec;
+        std::filesystem::current_path(os::process::GetExecutablePath().parent_path(), ec);
+    }
+
+    Config::Load();
+
+    if (forceInstallationCheck)
+    {
+        // Create the console to show progress to the user, otherwise it will seem as if the game didn't boot at all.
+        os::process::ShowConsole();
+
+        Journal journal;
+        double lastProgressMiB = 0.0;
+        double lastTotalMib = 0.0;
+        Installer::checkInstallIntegrity(GAME_INSTALL_DIRECTORY, journal, [&]()
+        {
+            constexpr double MiBDivisor = 1024.0 * 1024.0;
+            constexpr double MiBProgressThreshold = 128.0;
+            double progressMiB = double(journal.progressCounter) / MiBDivisor;
+            double totalMiB = double(journal.progressTotal) / MiBDivisor;
+            if (journal.progressCounter > 0)
+            {
+                if ((progressMiB - lastProgressMiB) > MiBProgressThreshold)
+                {
+                    fprintf(stdout, "Checking files: %0.2f MiB / %0.2f MiB\n", progressMiB, totalMiB);
+                    lastProgressMiB = progressMiB;
+                }
+            }
+            else
+            {
+                if ((totalMiB - lastTotalMib) > MiBProgressThreshold)
+                {
+                    fprintf(stdout, "Scanning files: %0.2f MiB\n", totalMiB);
+                    lastTotalMib = totalMiB;
+                }
+            }
+
+            return true;
+        });
+
+        char resultText[512];
+        uint32_t messageBoxStyle;
+        if (journal.lastResult == Journal::Result::Success)
+        {
+            snprintf(resultText, sizeof(resultText), "%s", Localise("IntegrityCheck_Success").c_str());
+            fprintf(stdout, "%s\n", resultText);
+            messageBoxStyle = SDL_MESSAGEBOX_INFORMATION;
+        }
+        else
+        {
+            snprintf(resultText, sizeof(resultText), Localise("IntegrityCheck_Failed").c_str(), journal.lastErrorMessage.c_str());
+            fprintf(stderr, "%s\n", resultText);
+            messageBoxStyle = SDL_MESSAGEBOX_ERROR;
+        }
+
+        SDL_ShowSimpleMessageBox(messageBoxStyle, GameWindow::GetTitle(), resultText, GameWindow::s_pWindow);
+        std::_Exit(int(journal.lastResult));
+    }
+
+#if defined(_WIN32) && defined(SAN_RECOMP_D3D12)
+    for (auto& dll : g_D3D12RequiredModules)
+    {
+        if (!std::filesystem::exists(g_executableRoot / dll))
+        {
+            char text[512];
+            snprintf(text, sizeof(text), Localise("System_Win32_MissingDLLs").c_str(), dll.data());
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, GameWindow::GetTitle(), text, GameWindow::s_pWindow);
+            std::_Exit(1);
+        }
+    }
+#endif
+
+    // Check the time since the last time an update was checked. Store the new time if the difference is more than six hours.
+    constexpr double TimeBetweenUpdateChecksInSeconds = 6 * 60 * 60;
+    time_t timeNow = std::time(nullptr);
+    double timeDifferenceSeconds = difftime(timeNow, Config::LastChecked);
+    if (timeDifferenceSeconds > TimeBetweenUpdateChecksInSeconds)
+    {
+        UpdateChecker::initialize();
+        UpdateChecker::start();
+        Config::LastChecked = timeNow;
+        Config::Save();
+    }
+
+    if (Config::ShowConsole)
+        os::process::ShowConsole();
+    LOGN_WARNING("Host Startup");
+    HostStartup();
+
+    std::filesystem::path modulePath;
+    bool isGameInstalled = Installer::checkGameInstall(GetGamePath(), modulePath);
+    bool runInstallerWizard = forceInstaller || forceDLCInstaller || !isGameInstalled;
+    
+    // TEMPORARY: Force installer UI to always show for preview
+    // TODO: Remove this line after UI preview is done
+    // runInstallerWizard = true;  // DISABLED - respect actual install check
+    
+     if (runInstallerWizard)
+     {
+         if (!Video::CreateHostDevice(sdlVideoDriver, graphicsApiRetry))
+         {
+             SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, GameWindow::GetTitle(), Localise("Video_BackendError").c_str(), GameWindow::s_pWindow);
+             std::_Exit(1);
+         }
+
+         if (!InstallerWizard::Run(GetGamePath(), isGameInstalled && forceDLCInstaller))
+         {
+             std::_Exit(0);
+         }
+     }
+
+    // ModLoader::Init();
+
+    printf("[Main] Calling KiSystemStartup...\n"); fflush(stdout);
+    KiSystemStartup();
+    printf("[Main] KiSystemStartup done\n"); fflush(stdout);
+
+    printf("[Main] Loading module: %s\n", modulePath.string().c_str()); fflush(stdout);
+    uint32_t entry = LdrLoadModule(modulePath);
+    printf("[Main] Module loaded, entry=0x%08X\n", entry); fflush(stdout);
+
+    if (!runInstallerWizard)
+    {
+        printf("[Main] Creating video device...\n"); fflush(stdout);
+        if (!Video::CreateHostDevice(sdlVideoDriver, graphicsApiRetry))
+        {
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, GameWindow::GetTitle(), Localise("Video_BackendError").c_str(), GameWindow::s_pWindow);
+            std::_Exit(1);
+        }
+        printf("[Main] Video device created\n"); fflush(stdout);
+    }
+    LOGN_WARNING("Start Guest Thread");
+    LOGN_WARNING(modulePath.string());
+    // Video::StartPipelinePrecompilation();
+
+    GuestThread::Start({ entry, 0, 0, 0 });
+
+    return 0;
+}
+
+GUEST_FUNCTION_STUB(__imp__vsprintf);
+GUEST_FUNCTION_STUB(__imp___vsnprintf);
+GUEST_FUNCTION_STUB(__imp__sprintf);
+GUEST_FUNCTION_STUB(__imp___snprintf);
+GUEST_FUNCTION_STUB(__imp___snwprintf);
+GUEST_FUNCTION_STUB(__imp__vswprintf);
+GUEST_FUNCTION_STUB(__imp___vscwprintf);
+GUEST_FUNCTION_STUB(__imp__swprintf);

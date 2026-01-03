@@ -1,0 +1,55 @@
+#pragma once
+
+#include <api/Liberty.h>
+#include <ui/common_menu.h>
+
+#define SAN_RECOMP_OPTIONS_MENU
+
+enum class OptionsMenuState
+{
+    Opening,
+    Idle,
+    Closing,
+    Restarting
+};
+
+enum class OptionsMenuFlowState
+{
+    CategoryCursor,
+    OptionCursor,
+    OptionSelected
+};
+
+enum class OptionsMenuCategory
+{
+    System,
+    Input,
+    Audio,
+    Video,
+    Debug,
+    Count
+};
+
+class OptionsMenu
+{
+public:
+    static inline CommonMenu s_commonMenu{};
+    static inline OptionsMenuState s_state{};
+    static inline OptionsMenuFlowState s_flowState{};
+    // TODO: Replace with GTA V menu system
+    // static inline Sonicteam::MainMenuTask* s_pMainMenuTask{};
+    // static inline Sonicteam::SoX::Audio::Cue* s_pBgmCue{};
+    static inline void* s_pMainMenuTask{}; // Placeholder
+    static inline void* s_pBgmCue{}; // Placeholder
+    static inline bool s_isVisible{};
+    static inline bool s_isPause{};
+    static inline bool s_isDebugUnlocked{};
+
+    static void Init();
+    static void Draw();
+    static void Open(bool isPause = false);
+    static void Close();
+    static bool CanClose();
+    static bool IsRestartRequired();
+    static void SetFlowState(OptionsMenuFlowState flowState);
+};

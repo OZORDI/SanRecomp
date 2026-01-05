@@ -20,7 +20,6 @@ San Recompiled is an unofficial PC port of the Xbox 360 version of Grand Theft A
 - [Installation](#installation)
 - [Building](#building)
 - [Documentation](#documentation)
-- [Credits](#credits)
 
 ## Project Status
 
@@ -94,22 +93,3 @@ cmake --build ./out/build/macos-release --target SanRecomp
 |----------|-------------|
 | [Building Guide](/docs/BUILDING.md) | Build instructions for all platforms |
 | [Dumping Guide](/docs/DUMPING-en.md) | How to extract game files from Xbox 360 |
-
-## Credits
-
-### San Recompiled
-- Based on [LibertyRecomp](https://github.com/OZORDI/LibertyRecomp) (GTA IV Recompiled)
-- Based on [MarathonRecomp](https://github.com/sonicnext-dev/MarathonRecomp) by the sonicnext-dev team
-
-### Original Framework Credits
-- [ga2mer](https://github.com/ga2mer): Creator of the original recompilation framework
-- [IsaacMarovitz](https://github.com/IsaacMarovitz): Graphics Programmer
-- [squidbus](https://github.com/squidbus): Graphics Programmer
-- [Hyper](https://github.com/hyperbx): System level features developer
-- And the entire MarathonRecomp team
-
-### Special Thanks
-- Unleashed Recompiled Development Team
-- [Skyth](https://github.com/blueskythlikesclouds): Graphics consultation
-- [Darío](https://github.com/DarioSamo): Creator of [plume](https://github.com/renderbag/plume) graphics abstraction layer
-- [ocornut](https://github.com/ocornut): Creator of [Dear ImGui](https://github.com/ocornut/imgui)

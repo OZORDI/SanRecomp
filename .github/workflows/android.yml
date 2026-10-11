@@ -1,0 +1,82 @@
+name: Android CI (SanRecomp V)
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch: # Permite que você ative a compilação manualmente pelo site do GitHub
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive # Baixa automaticamente as toolchains e o XenonRecomp inclusos
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+
+    - name: Setup Android SDK & NDK
+      uses: android-actions/setup-android@v3
+
+    - name: Install Android NDK (r26b or stable)
+      run: |
+        sdkmanager --install "ndk;26.1.10909125"
+        echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/26.1.10909125" >> $GITHUB_ENV
+
+    - name: Install CMake & Ninja
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake ninja-build ccache
+
+    - name: Configure CMake for Android (arm64-v8a)
+      run: |
+        cmake -B build_android \
+          -GNinja \
+          -DCMAKE_TOOLCHAIN_FILE=${{ env.ANDROID_NDK_HOME }}/build/cmake/android.toolchain.cmake \
+          -DANDROID_ABI=arm64-v8a \
+          -DANDROID_PLATFORM=android-26 \
+          -DSAN_RECOMP_TARGET_PLATFORM=android \
+          -DSAN_RECOMP_GRAINE_ANDROID=ON \
+          -DSAN_RECOMP_ANDROID_RUNTIME_ASSETS=ON \
+          -DCMAKE_BUILD_TYPE=Debug
+
+    - name: Build Native Libraries (.so)
+      run: |
+        cmake --build build_android --config Debug --target all
+
+    - name: Setup Gradle
+      uses: gradle/actions/setup-gradle@v3
+      with:
+        gradle-version: current
+
+    - name: Build APK via Gradle
+      run: |
+        if [ -d "os/android" ]; then
+          cd os/android
+          chmod +x gradlew
+          ./gradlew assembleDebug
+        else
+          echo "Aviso: Pasta os/android não encontrada. Pulando empacotamento do APK final."
+        fi
+
+    - name: Upload Native Binary Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: SanRecomp-Android-Shared-Libs
+        path: build_android/**/*.so
+
+    - name: Upload Pre-compiled APK
+      if: hashFiles('os/android/app/build/outputs/apk/debug/*.apk') != ''
+      uses: actions/upload-artifact@v4
+      with:
+        name: SanRecomp-Android-Debug-APK
+        path: os/android/app/build/outputs/apk/debug/*.apk
+        
